@@ -1,0 +1,224 @@
+services:
+  # ── App: PostgreSQL ─────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ecommerce
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: changeme
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD, pg_isready, -U, postgres]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── App: ClickHouse (app analytics tables: shopkit.*) ───────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.6-alpine
+    environment:
+      CLICKHOUSE_DB: shopkit
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: changeme
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ── App: one-shot migration (exits after running) ───────────────────────────
+  migrate:
+    build: ./server
+    command: >
+      sh -c "node src/db/migrate.js && node src/db/ch-migrate.js && node src/db/seed.js"
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://postgres:changeme@postgres:5432/ecommerce
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: shopkit
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: changeme
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+
+  # ── App: Express server ─────────────────────────────────────────────────────
+  server:
+    build: ./server
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://postgres:changeme@postgres:5432/ecommerce
+      JWT_SECRET: local-dev-secret
+      NODE_ENV: development
+      GOOGLE_KEY: ${GOOGLE_KEY:-}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: shopkit
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: changeme
+      # OpenTelemetry -> ClickStack/HyperDX (logs visible at http://localhost:8080)
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://clickstack:4318
+      OTEL_SERVICE_NAME: ecommerce-server
+      OTEL_SERVICE_VERSION: "1.0.0"
+      # Get this from HyperDX UI → Team Settings → API Keys
+      # Format must be: Authorization=Bearer <YOUR_API_KEY>
+      OTEL_EXPORTER_OTLP_HEADERS: ${HYPERDX_API_KEY:-}
+      # LibreChat AI assistant
+      LIBRECHAT_URL: http://librechat:3080
+      LIBRECHAT_MODEL: ${LIBRECHAT_MODEL:-gpt-4o-mini}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      clickstack:
+        condition: service_started
+      librechat:
+        condition: service_started
+    develop:
+      watch:
+        # Sync source files instantly — no rebuild needed (nodemon picks up changes)
+        - action: sync
+          path: ./server/src
+          target: /app/src
+          ignore:
+            - node_modules/
+        # Rebuild image if dependencies change
+        - action: rebuild
+          path: ./server/package.json
+        - action: rebuild
+          path: ./server/package-lock.json
+
+  # ── App: Vite/React client ──────────────────────────────────────────────────
+  client:
+    build: ./client
+    ports:
+      - "5173:80"
+    depends_on:
+      - server
+    develop:
+      watch:
+        # Rebuild the client image on any source change
+        # (Vite builds a static bundle — no dev server inside the container)
+        - action: rebuild
+          path: ./client/src
+        # Rebuild if config or deps change
+        - action: rebuild
+          path: ./client/package.json
+        - action: rebuild
+          path: ./client/vite.config.js
+
+  # ── ClickStack all-in-one (HyperDX UI + OTel collector + its own CH) ────────
+  # Docs: https://clickhouse.com/docs/use-cases/observability/clickstack/getting-started/oss
+  #
+  #   - HyperDX web UI   → http://localhost:8080  (create account on first visit)
+  #   - OTel gRPC        → localhost:4317
+  #   - OTel HTTP        → localhost:4318
+  #   - Its own internal ClickHouse on port 8124 (not exposed externally)
+  clickstack:
+    image: clickhouse/clickstack-all-in-one:latest
+    command: clickstack
+    ports:
+      - "8080:8080"    # HyperDX UI  →  open this in your browser
+      - "4317:4317"    # OTLP gRPC   →  send traces/logs here
+      - "4318:4318"    # OTLP HTTP   →  send traces/logs here
+      - "8124:8123"    # ClickStack's internal CH HTTP (optional, for direct SQL)
+    volumes:
+      - clickstack_db:/data/db
+      - clickstack_ch_data:/var/lib/clickhouse
+      - clickstack_ch_logs:/var/log/clickhouse-server
+    restart: unless-stopped
+
+  # ── LibreChat (AI assistant backend) ────────────────────────────────────────
+  # Docs: https://www.librechat.ai/docs/configuration/docker_override
+  #
+  # LibreChat provides an OpenAI-compatible API that the Express server proxies
+  # through /api/chat.  Configure your AI provider key in .env:
+  #   OPENAI_API_KEY  or  ANTHROPIC_API_KEY  or any other supported provider.
+  #
+  mongodb:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.7
+    restart: unless-stopped
+    environment:
+      MEILI_NO_ANALYTICS: "true"
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-meili-master-key-changeme}
+    volumes:
+      - meilisearch_data:/meili_data
+
+  librechat:
+    image: ghcr.io/danny-avila/librechat:latest
+    restart: unless-stopped
+    user: root
+    ports:
+      - "3080:3080"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3080
+      MONGO_URI: mongodb://mongodb:27017/LibreChat
+      MEILI_HOST: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-meili-master-key-changeme}
+      JWT_SECRET: ${JWT_SECRET:-librechat-jwt-secret-changeme}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-librechat-jwt-refresh-changeme}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LIBRECHAT_MODEL: ${LIBRECHAT_MODEL:-gpt-4o-mini}
+      GOOGLE_KEY: ${GOOGLE_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-} 
+      AINATIVE_API_KEY: ${AINATIVE_API_KEY:-}
+      ALLOW_REGISTRATION: "true"
+      ALLOW_SOCIAL_LOGIN: "false"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      meilisearch:
+        condition: service_started
+    volumes:
+      - librechat_uploads:/app/client/public/images
+      - librechat_logs:/app/api/logs
+      - ./librechat.yaml:/app/librechat.yaml:ro
+    # FIXED: Added curl to the alpine package installer
+    entrypoint: >
+      sh -c "apk add --no-cache gcc musl-dev python3-dev curl &&
+             curl -LsSf https://astral.sh/uv/install.sh | sh &&
+             export PATH=$HOME/.local/bin:$PATH &&
+             uvx mcp-clickhouse --help 2>/dev/null || true &&
+             node api/server/index.js"
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  clickstack_db:
+  clickstack_ch_data:
+  clickstack_ch_logs:
+  mongodb_data:
+  meilisearch_data:
+  librechat_uploads:
+  librechat_logs:

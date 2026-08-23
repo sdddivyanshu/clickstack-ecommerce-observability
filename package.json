@@ -1,0 +1,20 @@
+{
+  "name": "ecommerce-fullstack",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev --workspace=server\" \"npm run dev --workspace=client\"",
+    "build": "npm run build --workspace=client",
+    "db:migrate": "npm run migrate --workspace=server",
+    "ch:migrate": "npm run ch:migrate --workspace=server",
+    "db:seed": "npm run seed --workspace=server",
+    "db:ch-migrate": "npm run ch:migrate --workspace=server"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

@@ -1,0 +1,44 @@
+version: 1.2.1
+
+# ── Custom Endpoints ─────────────────────────────────────────────────────────────
+# Built-in providers (OpenAI, Anthropic, Google, Azure OpenAI, Bedrock) need
+# nothing here — they activate automatically from their env vars in docker-compose.yml.
+# AINative is NOT a built-in provider, so it must be declared manually as an
+# OpenAI-compatible custom endpoint.
+endpoints:
+  custom:
+    - name: "AINative"
+      apiKey: "${AINATIVE_API_KEY}"
+      # TODO: confirm the exact base URL from your AINative dashboard/docs —
+      # this is a placeholder pattern, not a verified value.
+      baseURL: "https://openrouter.ai/api/v1/"
+      models:
+        # TODO: replace with the actual model IDs AINative exposes for Claude.
+        default: ["openrouter/free"]
+        fetch: true
+      titleConvo: true
+      titleModel: "current_model"
+      modelDisplayLabel: "AINative"
+
+# ── MCP Servers ────────────────────────────────────────────────────────────────
+mcpServers:
+  clickhouse:
+    type: stdio
+    command: uvx
+    args:
+      - mcp-clickhouse
+    env:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: changeme
+      CLICKHOUSE_DATABASE: shopkit
+      CLICKHOUSE_SECURE: "false"
+      CLICKHOUSE_VERIFY: "false"
+      CLICKHOUSE_READONLY: "true"
+
+# ── Interface config ────────────────────────────────────────────────────────────
+interface:
+  mcpServers:
+    use: true
+    create: false
